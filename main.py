@@ -1,29 +1,18 @@
 from flask import Flask, request, jsonify
-import requests, os, re, hashlib
+import requests, os, re
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urldefrag, urlparse
 
 app = Flask(__name__)
 
-# ===== Weaviate (inlined for your test) =====
-WEAVIATE_URL = os.environ.get(
-    "WEAVIATE_URL",
-    "https://54he2t8ht0e239j2vi4eow.c0.us-west3.gcp.weaviate.cloud"
-)
-WEAVIATE_API_KEY = os.environ.get(
-    "WEAVIATE_API_KEY",
-    "aXk0MEhaUVJldmVnT0JCb19MUnB4OWtsUDVaRTBnOVJmSTh3Z090WS84cmgzYW9tdmsvN1l5VEFVWmFFPV92MjAw"
-)
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "https://54he2t8ht0e239j2vi4eow.c0.us-west3.gcp.weaviate.cloud")
+WEAVIATE_API_KEY = os.environ.get("WEAVIATE_API_KEY", "aXk0MEhaUVJldmVnT0JCb19MUnB4OWtsUDVaRTBnOVJmSTh3Z090WS84cmgzYW9tdmsvN1l5VEFVWmFFPV92MjAw")
+CLASS_NAME = os.environ.get("WEAVIATE_CLASS", "DocChunk")
 
-# Use Collections API (v2) – no manual schema creation needed
-COLLECTION_NAME = os.environ.get("WEAVIATE_COLLECTION", "DocChunk")
-W_HEADERS = {
-    "Authorization": f"Bearer {WEAVIATE_API_KEY}",
-    "Content-Type": "application/json"
-}
+W_HEADERS = {"Authorization": f"Bearer {WEAVIATE_API_KEY}", "Content-Type": "application/json"}
 HEADERS = {"User-Agent": "InnovateSphere-RAG-Indexer/1.0"}
 
-# ---------- helpers ----------
+# ------------ helpers ------------
 def same_site(seed, url):
     a, b = urlparse(seed), urlparse(url)
     return (a.scheme, a.netloc) == (b.scheme, b.netloc)
@@ -34,7 +23,8 @@ def clean(t):
 def extract(html, base_url):
     soup = BeautifulSoup(html, "lxml")
     for sel in ["nav","footer","script","style","noscript","aside"]:
-        for tag in soup.select(sel): tag.decompose()
+        for tag in soup.select(sel):
+            tag.decompose()
     main = soup.select_one("main") or soup.select_one("article") or soup.body
     if not main: return "", ""
     title = soup.title.string.strip() if soup.title and soup.title.string else urlparse(base_url).path
@@ -73,28 +63,22 @@ def crawl(start_urls, max_pages=10):
             continue
     return pages
 
-# ---------- Weaviate v2 upsert (auto schema) ----------
-def upsert_object_v2(props: dict):
-    """
-    Auto-schema: Weaviate will create the collection on first insert
-    when using the v2 Objects API if it's not there yet.
-    """
-    url = f"{WEAVIATE_URL}/v2/objects"
+def upsert_object_v1(props: dict):
+    # Classic v1 insert with auto-schema (no prior class creation)
+    url = f"{WEAVIATE_URL}/v1/objects"
     payload = {
-        "collection": COLLECTION_NAME,
+        "class": CLASS_NAME,
         "properties": props
     }
     r = requests.post(url, headers=W_HEADERS, json=payload, timeout=30)
-    # 201 = created, 200 = OK (depends on cluster)
-    if r.status_code not in (200, 201):
-        # Surface helpful error
-        try:
-            return False, r.status_code, r.json()
-        except Exception:
-            return False, r.status_code, r.text
-    return True, r.status_code, None
+    if r.status_code in (200, 201):
+        return True, None
+    try:
+        return False, r.json()
+    except Exception:
+        return False, {"status": r.status_code, "text": r.text}
 
-# ---------- routes ----------
+# ------------ routes ------------
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
@@ -113,11 +97,10 @@ def indexer():
 
     pages = crawl(start_urls, max_pages=max_pages)
 
-    upserted = 0
-    errors = []
+    upserted, errors = 0, []
     for p in pages:
         for c in chunk(p["text"]):
-            ok, code, detail = upsert_object_v2({
+            ok, err = upsert_object_v1({
                 "text": c,
                 "url": p["url"],
                 "title": p["title"],
@@ -126,7 +109,7 @@ def indexer():
             if ok:
                 upserted += 1
             else:
-                errors.append({"status": code, "detail": detail})
+                errors.append(err)
 
     resp = {"upserted": upserted, "namespace": source, "pages": len(pages)}
     if errors:
