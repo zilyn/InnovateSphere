@@ -22,6 +22,7 @@ W_HEADERS = {
     "Content-Type": "application/json"
 }
 
+# ---------- small utils ----------
 def same_site(seed, url):
     a, b = urlparse(seed), urlparse(url)
     return (a.scheme, a.netloc) == (b.scheme, b.netloc)
@@ -78,16 +79,9 @@ def crawl(start_urls, max_pages=10):
             continue
     return pages
 
-def ensure_class():
-    # Creates a class using Weaviate-managed embeddings (text2vec-weaviate)
-    try:
-        schema = requests.get(f"{WEAVIATE_URL}/v1/schema", headers=W_HEADERS, timeout=20).json()
-        if any(c.get('class') == CLASS_NAME for c in schema.get('classes', [])):
-            return
-    except Exception:
-        pass
-
-    body = {
+# ---------- schema handling ----------
+def class_definition():
+    return {
         "class": CLASS_NAME,
         "vectorizer": "text2vec-weaviate",
         "properties": [
@@ -97,10 +91,51 @@ def ensure_class():
             {"name": "source", "dataType": ["text"]}
         ]
     }
-    requests.post(
-        f"{WEAVIATE_URL}/v1/schema/classes", 
-        headers=W_HEADERS, json=body, timeout=30
-    ).raise_for_status()
+
+def ensure_class():
+    # 1) Check if class exists
+    try:
+        resp = requests.get(f"{WEAVIATE_URL}/v1/schema", headers=W_HEADERS, timeout=20)
+        resp.raise_for_status()
+        schema = resp.json()
+        if any(c.get('class') == CLASS_NAME for c in schema.get('classes', [])):
+            return
+    except Exception as e:
+        # If schema read fails, let upserts try & fail with clear message
+        print("Schema GET failed:", e)
+
+    # 2) Try POST /v1/schema/classes
+    try:
+        r = requests.post(f"{WEAVIATE_URL}/v1/schema/classes",
+                          headers=W_HEADERS, json=class_definition(), timeout=30)
+        if r.status_code in (200, 201):
+            return
+        # If not allowed, try fallback
+        if r.status_code == 405:
+            raise requests.HTTPError("405 on /v1/schema/classes")
+        r.raise_for_status()
+    except Exception as e:
+        print("POST /v1/schema/classes failed:", e)
+        # 3) Fallback: PUT /v1/schema with full schema
+        try:
+            full = {"classes": [class_definition()]}
+            r2 = requests.put(f"{WEAVIATE_URL}/v1/schema", headers=W_HEADERS, json=full, timeout=30)
+            if r2.status_code in (200, 201):
+                return
+            r2.raise_for_status()
+        except Exception as e2:
+            print("PUT /v1/schema failed:", e2)
+            # Final hint to user
+            raise RuntimeError(
+                "Could not create class in Weaviate (POST/PUT blocked). "
+                "Create class 'DocChunk' manually in WCS UI with vectorizer 'text2vec-weaviate' "
+                "and properties: text,url,title,source (all text)."
+            )
+
+# ---------- routes ----------
+@app.route("/", methods=["GET"])
+def health():
+    return "OK", 200
 
 @app.route("/", methods=["POST"])
 def indexer():
@@ -114,7 +149,10 @@ def indexer():
     if not WEAVIATE_URL or not WEAVIATE_API_KEY:
         return jsonify({"error": "Missing Weaviate credentials"}), 500
 
-    ensure_class()
+    try:
+        ensure_class()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
     pages = crawl(start_urls, max_pages=max_pages)
 
@@ -145,5 +183,4 @@ def indexer():
     return jsonify({"upserted": upserted, "namespace": source, "pages": len(pages)})
 
 if __name__ == "__main__":
-    # Local run (Render will use the Procfile/gunicorn)
     app.run(host="0.0.0.0", port=8080)
